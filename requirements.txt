@@ -1,0 +1,7 @@
+ffmpeg-python
+opencv-python
+paddlepaddle
+paddleocr
+Pillow
+openai
+pytesseract
