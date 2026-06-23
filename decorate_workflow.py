@@ -115,7 +115,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--image", default=None,
-        help="标定用的参考图片（不传则从视频 30%% 位置抽帧）",
+        help="标定用的参考图片",
+    )
+    parser.add_argument(
+        "--time", default=None,
+        help="从视频指定时间点抽帧（如 1:30 或 90.5），默认 30%% 位置",
     )
     parser.add_argument(
         "--boxes", default=None,
@@ -245,8 +249,22 @@ def load_decorations(path: str, boxes_def: Dict[str, Dict]) -> List[Dict]:
 # 标定模式
 # ---------------------------------------------------------------------------
 
-def extract_reference_frame(video_path: str) -> np.ndarray:
-    """从视频 30% 位置抽取一帧作为标定参考图。"""
+def parse_time_arg(time_str: str) -> float:
+    """解析时间字符串为秒数。支持 '1:30' / '0:05.5' / '90.5' / '90'。"""
+    time_str = time_str.strip()
+    if ":" in time_str:
+        parts = time_str.split(":")
+        if len(parts) != 2:
+            raise ValueError(f"时间格式错误（应为 mm:ss 或秒数）: {time_str}")
+        return int(parts[0]) * 60 + float(parts[1])
+    return float(time_str)
+
+
+def extract_reference_frame(
+    video_path: str,
+    target_time: Optional[float] = None,
+) -> np.ndarray:
+    """从视频指定时间点抽取一帧作为标定参考图。未指定则默认 30% 位置。"""
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video_path}")
@@ -254,7 +272,9 @@ def extract_reference_frame(video_path: str) -> np.ndarray:
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     frame_count = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     duration = frame_count / fps if fps > 0 else 0
-    target_time = duration * 0.3
+
+    if target_time is None:
+        target_time = duration * 0.3
 
     cap.set(cv2.CAP_PROP_POS_MSEC, target_time * 1000)
     ret, frame = cap.read()
@@ -359,8 +379,10 @@ def run_calibrate(args: argparse.Namespace) -> None:
     elif args.input:
         if not os.path.exists(args.input):
             raise FileNotFoundError(f"视频不存在: {args.input}")
-        image = extract_reference_frame(args.input)
-        print(f"从视频抽取参考帧: {args.input}")
+        target = parse_time_arg(args.time) if args.time else None
+        image = extract_reference_frame(args.input, target)
+        time_label = args.time if args.time else "30%"
+        print(f"从视频抽取参考帧: {args.input} @ {time_label}")
     else:
         raise RuntimeError("标定模式需要 --input <视频> 或 --image <图片>")
 

@@ -253,7 +253,7 @@ decor_boxes.json ──────────▶  final_decorated.mp4
 python decorate_workflow.py --calibrate --input input/p1.mp4
 
 # 或指定参考图片
-python decorate_workflow.py --calibrate --image reference.png --input input/p1.mp4
+python decorate_workflow.py --calibrate --input input/p1.mp4 --time 1:30
 
 # 第二步：手写 work/<项目>/output/decorations.json
 
@@ -313,7 +313,8 @@ python decorate_workflow.py --input input/p1.mp4
 | ----------------- | ----------------------------------- | ------------------------------ |
 | `--input`         | 无（合成模式必需）                  | 输入视频                       |
 | `--calibrate`     | 关                                  | 进入交互式标定模式             |
-| `--image`         | 无                                  | 标定参考图（不传则从视频抽帧） |
+| `--image`         | 无                                  | 标定参考图（也可用 --time 从视频抽帧） |
+| `--time`          | 30% 位置                            | 从视频指定时间点抽帧（`1:30` 或 `90.5`） |
 | `--boxes`         | `work/<项目>/decor_boxes.json`      | boxes 文件路径                 |
 | `--decorations`   | `work/<项目>/output/decorations.json` | decorations 文件路径         |
 | `--output`        | `work/<项目>/output/final_decorated.mp4` | 输出视频                 |
