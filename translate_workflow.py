@@ -4,6 +4,7 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 from fractions import Fraction
@@ -17,13 +18,19 @@ import json
 
 from PIL import Image, ImageDraw, ImageFont
 
-# python translate_workflow.py --input input/p1.mp4 --calibrate
+# python translate_workflow.py --input input/p1.mp4
 # python translate_workflow.py --input input/p1.mp4 --load-segments
 
 
 # 配置
 DEEPSEEK_API_KEY = None  # 请在 .env 文件或环境变量中设置
 SAMPLE_FRAME_INTERVAL = 15  # 默认每 15 帧检测一次对话变化
+# OCR 文本分组配置
+DEFAULT_GROUP_OVERLAP = 0.5   # 字符重叠率阈值，≥此值视为同一句
+DEFAULT_LENGTH_RATIO = 0.4    # 长度比阈值，<此值的不归为同组（方案三）
+# 曲线分析配置（--curve-split）
+DEFAULT_CURVE_DEPTH = 0.2     # 谷底最小深度
+DEFAULT_CURVE_THRESHOLD = 0.6 # 谷底相似度上限
 # MAD 像素差异检测配置
 MAD_DIFF_THRESHOLD = 10.0  # 默认差异阈值，值越小越敏感
 MAD_SAMPLE_SIZE = (160, 90)  # 用于比较的缩略图尺寸
@@ -152,9 +159,33 @@ def parse_args() -> argparse.Namespace:
         help=f"MAD 差异阈值，值越小越敏感，默认 {MAD_DIFF_THRESHOLD}",
     )
     parser.add_argument(
-        "--calibrate",
+        "--group-overlap",
+        type=float,
+        default=DEFAULT_GROUP_OVERLAP,
+        help=f"OCR 文本分组字符重叠率阈值，默认 {DEFAULT_GROUP_OVERLAP}",
+    )
+    parser.add_argument(
+        "--length-ratio",
+        type=float,
+        default=DEFAULT_LENGTH_RATIO,
+        help=f"分组时文本长度比下限 (0~1)，默认 {DEFAULT_LENGTH_RATIO}；设 0 则禁用",
+    )
+    parser.add_argument(
+        "--curve-split",
         action="store_true",
-        help="交互式标定对话框区域（OCR 区域和字幕覆盖区域），坐标保存到 boxes.json",
+        help="启用相似度曲线分析，在自然谷底处进一步拆分 segment（实验性）",
+    )
+    parser.add_argument(
+        "--curve-depth",
+        type=float,
+        default=DEFAULT_CURVE_DEPTH,
+        help=f"曲线拆分谷底最小深度，默认 {DEFAULT_CURVE_DEPTH}",
+    )
+    parser.add_argument(
+        "--curve-threshold",
+        type=float,
+        default=DEFAULT_CURVE_THRESHOLD,
+        help=f"曲线拆分谷底相似度上限，默认 {DEFAULT_CURVE_THRESHOLD}",
     )
     parser.add_argument(
         "--box-color",
@@ -299,7 +330,7 @@ def analyze_video(path: str) -> Tuple[float, int, int, float]:
 
 
 def estimate_boxes(width: int, height: int) -> Dict[str, Tuple[int, int, int, int]]:
-    boxes_file = os.path.join(BASE_DIR, "boxes.json")
+    boxes_file = os.path.join(WORK_DIR, "boxes.json")
     if os.path.exists(boxes_file):
         with open(boxes_file, "r", encoding="utf-8") as f:
             saved = json.load(f)
@@ -380,6 +411,8 @@ def group_samples_by_text(
     samples: List[Dict],
     all_texts: List[str],
     duration: float,
+    overlap_threshold: float = DEFAULT_GROUP_OVERLAP,
+    length_ratio_threshold: float = DEFAULT_LENGTH_RATIO,
 ) -> List[Segment]:
     """基于 OCR 文本相似度进行对话分组。
 
@@ -397,10 +430,18 @@ def group_samples_by_text(
 
         same_utterance = False
         if prev_text and curr_text:
+            # 递进文本：始终同组（打字机效果，长度自然会差很多）
+            is_prog = is_progressive_text(prev_text, curr_text)
+            # 字符重叠 + 长度比：非递进时两条件都要满足
+            overlap_ok = char_overlap_ratio(prev_text, curr_text) >= overlap_threshold
+            length_ok = (
+                length_ratio_threshold <= 0
+                or text_length_ratio(prev_text, curr_text) >= length_ratio_threshold
+            )
             same_utterance = (
-                is_progressive_text(prev_text, curr_text)
-                or char_overlap_ratio(prev_text, curr_text) >= 0.5
+                is_prog
                 or prev_text == curr_text
+                or (overlap_ok and length_ok)
             )
         elif not prev_text and not curr_text:
             same_utterance = True
@@ -515,15 +556,37 @@ def compact_for_compare(text: str) -> str:
 
 
 def is_noise_text(text: str) -> bool:
+    """判定文本是否为 OCR 噪声。
+
+    判断依据：日语字符占比。无假名/汉字 → 噪声；占比 < 0.3 → 噪声。
+    """
     stripped = text.strip()
     if not stripped:
         return True
-    return bool(re.fullmatch(r"[0-9A-Za-z_|/\\.,:;+\-=]+", stripped)) and len(stripped) <= 4
+    jp_chars = sum(1 for c in stripped if (
+        '぀' <= c <= 'ゟ' or '゠' <= c <= 'ヿ' or
+        '一' <= c <= '鿿' or '　' <= c <= '〿'
+    ))
+    # 无任何日语字符 → 噪声（无论多长）
+    if jp_chars == 0:
+        return True
+    # 日语字符密度过低 → 噪声
+    if jp_chars / len(stripped) < 0.3:
+        return True
+    return False
 
 
 def clean_ocr_text(text: str) -> str:
-    """去除 OCR 结果中的数字/符号前缀噪声（如 \"1000000あたし\" → \"あたし\"）。"""
-    cleaned = re.sub(r"^[\d\s_|/\\.,:;+\-=\"']+", "", text.strip())
+    """去除 OCR 结果首尾的数字/符号噪声。
+
+    "1000000あたし//!!" → "あたし"
+    "|/\\声優" → "声優"
+    """
+    cleaned = text.strip()
+    # 去除前缀
+    cleaned = re.sub(r"^[\d\s_|/\\.,:;+\-=\"']+", "", cleaned)
+    # 去除后缀
+    cleaned = re.sub(r"[\d\s_|/\\.,:;+\-=\"']+$", "", cleaned)
     return cleaned
 
 
@@ -562,6 +625,141 @@ def char_overlap_ratio(a: str, b: str) -> float:
     return len(intersection) / min(len(set_a), len(set_b))
 
 
+def text_length_ratio(a: str, b: str) -> float:
+    """两个文本的长度比（≤1），短/长。突然大幅变化→可能是换句。"""
+    if not a or not b:
+        return 0.0
+    la, lb = len(a), len(b)
+    if la <= 0 or lb <= 0:
+        return 0.0
+    return min(la, lb) / max(la, lb)
+
+
+def find_curve_breakpoints(
+    similarities: List[float],
+    threshold: float = DEFAULT_CURVE_THRESHOLD,
+    min_depth: float = DEFAULT_CURVE_DEPTH,
+) -> List[int]:
+    """在相似度曲线上找自然断点（谷底）。
+
+    similarities[i] = 帧 i 与 帧 i+1 之间的相似度。
+    返回需要断开的帧索引（即 similarities 中谷底位置 + 1）。
+    """
+    if len(similarities) < 2:
+        return []
+    breakpoints: List[int] = []
+    for i in range(1, len(similarities) - 1):
+        left = similarities[i - 1]
+        mid = similarities[i]
+        right = similarities[i + 1]
+
+        # 局部最小值
+        if mid < left and mid < right:
+            depth = min(left - mid, right - mid)
+            if mid < threshold and depth > min_depth:
+                breakpoints.append(i + 1)  # 断在帧 i+1 处
+    return breakpoints
+
+
+def split_segments_by_curve(
+    segments: List[Segment],
+    samples: List[Dict],
+    all_texts: List[str],
+    threshold: float = DEFAULT_CURVE_THRESHOLD,
+    min_depth: float = DEFAULT_CURVE_DEPTH,
+) -> List[Segment]:
+    """对已有 segments 做相似度曲线分析，在自然谷底处进一步拆分。
+
+    在每个 segment 内部计算相邻采样帧的 char_overlap_ratio，
+    找到局部谷底，满足条件时拆分 segment。
+    """
+    new_segments: List[Segment] = []
+    split_count = 0
+
+    for seg in segments:
+        # 找到该 segment 时间范围内的采样帧
+        seg_end = seg.end if seg.end is not None else float('inf')
+        seg_indices = [
+            i for i, s in enumerate(samples)
+            if seg.start <= s['time'] < seg_end
+        ]
+
+        if len(seg_indices) < 3:
+            new_segments.append(seg)
+            continue
+
+        # 计算段内相邻帧相似度
+        seg_texts = [all_texts[i] for i in seg_indices]
+        similarities: List[float] = []
+        for k in range(1, len(seg_texts)):
+            sim = char_overlap_ratio(seg_texts[k - 1], seg_texts[k])
+            # 任一为空 → 相似度 0（强断点信号）
+            if not seg_texts[k - 1] or not seg_texts[k]:
+                sim = 0.0
+            similarities.append(sim)
+
+        # 找谷底断点
+        breakpoints = find_curve_breakpoints(similarities, threshold, min_depth)
+        if not breakpoints:
+            new_segments.append(seg)
+            continue
+
+        # 在断点处拆分
+        prev_offset = 0
+        for bp in breakpoints:
+            sub_indices = seg_indices[prev_offset:bp]
+            if not sub_indices:
+                prev_offset = bp
+                continue
+
+            candidates = [
+                (i, all_texts[i]) for i in sub_indices
+                if all_texts[i] and not is_noise_text(all_texts[i])
+            ]
+            best_text = ""
+            if candidates:
+                _, best_text = max(candidates, key=lambda x: _score_ocr_text(x[1]))
+
+            start_time = samples[sub_indices[0]]['time']
+            end_time = samples[seg_indices[bp]]['time'] if bp < len(seg_indices) else seg.end
+            new_segments.append(Segment(start=start_time, end=end_time, ja=best_text))
+            prev_offset = bp
+            split_count += 1
+
+        # 最后一段
+        last_indices = seg_indices[prev_offset:]
+        if last_indices:
+            candidates = [
+                (i, all_texts[i]) for i in last_indices
+                if all_texts[i] and not is_noise_text(all_texts[i])
+            ]
+            best_text = ""
+            if candidates:
+                _, best_text = max(candidates, key=lambda x: _score_ocr_text(x[1]))
+            new_segments.append(Segment(
+                start=samples[last_indices[0]]['time'],
+                end=seg.end,
+                ja=best_text,
+            ))
+        else:
+            # 没有剩余帧，延长前一个 segment
+            if new_segments:
+                new_segments[-1].end = seg.end
+
+    # 修正 segment 结束时间
+    for i in range(len(new_segments) - 1):
+        if new_segments[i].end is None or new_segments[i].end > new_segments[i + 1].start:
+            new_segments[i].end = new_segments[i + 1].start
+    for seg in new_segments:
+        if seg.end is None:
+            seg.end = seg.start + 5.0  # fallback
+
+    if split_count:
+        print(f"  曲线分析拆分了 {split_count} 个 segment")
+
+    return new_segments
+
+
 def merge_progressive_segments(segments: List[Segment]) -> List[Segment]:
     merged: List[Segment] = []
     for segment in segments:
@@ -598,7 +796,12 @@ def load_dotenv(path: str = os.path.join(BASE_DIR, ".env")) -> None:
             os.environ.setdefault(key, value)
 
 
+# 翻译 API 调用间隔控制
+_last_api_call_time: float = 0.0
+
 def translate_text(text: str, model: str) -> str:
+    global _last_api_call_time
+
     api_key = DEEPSEEK_API_KEY or os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise RuntimeError("未设置 DEEPSEEK_API_KEY。请在环境变量或项目 .env 中设置，或显式使用 --no-translate。")
@@ -615,6 +818,12 @@ def translate_text(text: str, model: str) -> str:
 
     client = openai.OpenAI(api_key=api_key, base_url="https://api.deepseek.com")
     for attempt in range(3):
+        # 调用间隔控制：两次成功调用之间至少间隔 0.3 秒，避免频率限制
+        now = time.time()
+        since_last = now - _last_api_call_time
+        if since_last < 0.3:
+            time.sleep(0.3 - since_last)
+
         response = client.chat.completions.create(
             model=model,
             messages=[
@@ -622,13 +831,29 @@ def translate_text(text: str, model: str) -> str:
                 {"role": "user", "content": text},
             ],
             temperature=0.7,
-            max_tokens=300,
+            max_tokens=500,
+            extra_body={"thinking": {"type": "disabled"}},
         )
-        result = response.choices[0].message.content
+        _last_api_call_time = time.time()
+
+        choice = response.choices[0]
+        result = choice.message.content
+        finish = choice.finish_reason
+
         if result:
             return result.strip()
+
+        # 空返回 → 诊断 + 指数退避
+        delay = 1.0 * (2 ** attempt)  # 1s, 2s, 4s
+        print(
+            f"  翻译返回空 (第 {attempt + 1}/3 次): "
+            f"finish_reason={finish}, "
+            f"text={text[:50]}..., "
+            f"{delay:.0f}s 后重试"
+        )
         if attempt < 2:
-            print(f"  翻译返回空，重试第 {attempt + 1} 次: {text[:40]}...")
+            time.sleep(delay)
+
     print(f"  警告: 翻译 3 次均返回空: {text[:60]}")
     return ""
 
@@ -1191,22 +1416,23 @@ def main() -> None:
 
     configure_work_paths(input_video)
     ensure_dirs()
-    if not args.calibrate and not args.load_segments and not args.no_translate and not (DEEPSEEK_API_KEY or os.environ.get("DEEPSEEK_API_KEY")):
+    if not args.load_segments and not args.no_translate and not (DEEPSEEK_API_KEY or os.environ.get("DEEPSEEK_API_KEY")):
         raise RuntimeError("未设置 DEEPSEEK_API_KEY，不能调用 DeepSeek API 翻译。请设置环境变量/项目 .env，或显式加 --no-translate。")
 
     print(f"项目目录: {WORK_DIR}")
 
     fps, width, height, duration = analyze_video(input_video)
 
-    if args.calibrate:
+    # 自动标定：如果工作目录下没有 boxes.json，则引导用户标定
+    boxes_path = os.path.join(WORK_DIR, "boxes.json")
+    if not os.path.exists(boxes_path):
+        print("未找到标定文件，进入交互式标定...")
         boxes = calibrate_boxes(input_video, duration)
-        boxes_path = os.path.join(BASE_DIR, "boxes.json")
         with open(boxes_path, "w", encoding="utf-8") as f:
             json.dump(boxes, f, indent=2, ensure_ascii=False)
         print(f"标定完成，坐标已保存到 {boxes_path}")
         print(f"  OCR 区域: {boxes['ocr_box']}")
         print(f"  覆盖区域: {boxes['overlay_box']}")
-        return
 
     boxes = estimate_boxes(width, height)
     print(f"视频分析: fps={fps:.2f}, 分辨率={width}x{height}, 时长={duration:.2f}s")
@@ -1343,8 +1569,22 @@ def main() -> None:
             all_texts = ocr_dialogue(all_crops, ocr_engine)
             print(f"OCR 完成: {len(all_texts)} 帧")
 
-            segments = group_samples_by_text(samples, all_texts, duration)
+            segments = group_samples_by_text(
+                samples, all_texts, duration,
+                overlap_threshold=args.group_overlap,
+                length_ratio_threshold=args.length_ratio,
+            )
             print(f"文本分组后 {len(segments)} 个对话片段")
+
+            # === 曲线分析拆分（可选）===
+            if args.curve_split:
+                before_curve = len(segments)
+                segments = split_segments_by_curve(
+                    segments, samples, all_texts,
+                    threshold=args.curve_threshold,
+                    min_depth=args.curve_depth,
+                )
+                print(f"曲线分析拆分后 {len(segments)} 个对话片段 (拆分 {len(segments) - before_curve} 个)")
 
             # === 长 segment 拆分（> 5s）===
             new_segments: List[Segment] = []

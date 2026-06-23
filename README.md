@@ -40,9 +40,8 @@ cp your_video.mp4 input/p1.mp4
 #    方式 B: 项目根目录创建 .env
 echo DEEPSEEK_API_KEY=sk-xxx > .env
 
-# 3. 运行
-python translate_workflow.py --input input/p1.mp4 --calibrate  # 手动框定ocr识别范围以及字幕显示范围，框定后按enter确认
-python translate_workflow.py --input input/p1.mp4 # 真正开始翻译
+# 3. 运行（首次运行会自动弹出标定窗口）
+python translate_workflow.py --input input/p1.mp4
 ```
 
 ## 完整工作流（两步法）
@@ -77,7 +76,6 @@ python translate_workflow.py --input input/p1.mp4 --load-segments
 | 参数                      | 默认值              | 说明                                           |
 | ------------------------- | ------------------- | ---------------------------------------------- |
 | `--input`                 | `input/input.mp4`   | 输入视频路径                                   |
-| `--calibrate`             | 关                  | 手动框定 ocr 与字幕范围                        |
 | `--no-translate`          | 关                  | 跳过翻译，OCR 原文作为字幕（快速预览）         |
 | `--load-segments`         | 关                  | 从 segments.json 加载校对后文本，跳过 OCR+翻译 |
 | `--model`                 | `deepseek-v4-flash` | DeepSeek 翻译模型                              |
@@ -149,11 +147,10 @@ DEEPSEEK_API_KEY=sk-你的密钥
 
 ### `boxes.json` — 对话框区域
 
-使用 `--calibrate` 交互式标定生成，存放在项目根目录：
+首次运行时会自动弹出标定窗口，无需手动指定。坐标保存在 `work/<视频名>/` 目录下，每个视频独立管理：
 
 ```json
 {
-  "comment":[x,y,矩形宽度，矩形高度],
   "ocr_box": [192, 874, 1051, 108],
   "overlay_box": [192, 885, 1051, 146],
   "width": 1440,
@@ -162,7 +159,8 @@ DEEPSEEK_API_KEY=sk-你的密钥
 ```
 
 - 存在 → 自动加载，分辨率不匹配时警告
-- 不存在 → 回退硬编码百分比（适用于 16:9 视频）
+- 不存在 → 自动弹出交互式标定窗口
+- 删除后重新运行即可重新标定
 
 ### `segments.json` — 翻译片段
 
@@ -186,18 +184,23 @@ DEEPSEEK_API_KEY=sk-你的密钥
 ```
 translator_syanimasu/
 ├── translate_workflow.py
+├── decorate_workflow.py      # 装饰叠加脚本
 ├── .env                       # API Key
-├── boxes.json                 # 标定坐标（可选）
 ├── README.md
+├── requirements.txt
 ├── input/
-│   └── p1.mp4                 # 输入视频例子
+│   └── p1.mp4                 # 输入视频
 └── work/
     └── p1/
+        ├── boxes.json             # 翻译标定坐标
+        ├── decor_boxes.json       # 装饰标定坐标（多区域命名）
         └── output/
             ├── segments.json      # 翻译片段（校对编辑此文件）
+            ├── decorations.json   # 装饰数据（用户手写）
             ├── subtitles.ass      # 中文字幕
             ├── subtitles_ja.ass   # 日语字幕
-            └── final_cn.mp4       # 成品视频
+            ├── final_cn.mp4       # 翻译成品视频
+            └── final_decorated.mp4 # 装饰成品视频
 ```
 
 每个输入视频使用独立的 `work/<视频名>/` 目录，互不干扰。
@@ -207,9 +210,6 @@ translator_syanimasu/
 ```bash
 # 快速测试 OCR 效果（不调 API）
 python translate_workflow.py --input input/p1.mp4 --no-translate
-
-# 标定对话框区域
-python translate_workflow.py --input input/p1.mp4 --calibrate
 
 # 校对后重新渲染
 python translate_workflow.py --input input/p1.mp4 --load-segments
@@ -230,6 +230,95 @@ python translate_workflow.py --input input/p1.mp4 --crf 18 --preset slow
 # 密集采样（适合快节奏对话）
 python translate_workflow.py --input input/p1.mp4 --sample-frame-interval 5
 ```
+
+## 装饰叠加（decorate_workflow.py）
+
+独立脚本，将用户自定义的文本框/图片叠加到视频上。与翻译管线互不干扰。
+
+### 两步法
+
+```
+标定                              合成
+───────────                    ─────────────────────
+参考图 → 框选区域并命名           视频 + decor_boxes.json
+  │                                + decorations.json
+  ▼                                  │
+decor_boxes.json ──────────▶  final_decorated.mp4
+```
+
+### 快速开始
+
+```bash
+# 第一步：标定（从视频抽参考帧）
+python decorate_workflow.py --calibrate --input input/p1.mp4
+
+# 或指定参考图片
+python decorate_workflow.py --calibrate --image reference.png --input input/p1.mp4
+
+# 第二步：手写 work/<项目>/output/decorations.json
+
+# 第三步：合成
+python decorate_workflow.py --input input/p1.mp4
+```
+
+### decor_boxes.json（标定生成）
+
+```json
+{
+  "width": 1920,
+  "height": 1080,
+  "boxes": {
+    "speaker_tag": {
+      "type": "text",
+      "box": [80, 40, 320, 64],
+      "style": {}
+    },
+    "dialogue": {
+      "type": "text",
+      "box": [120, 820, 1680, 180],
+      "style": {"font_size": 46}
+    }
+  }
+}
+```
+
+每个 box 可指定独立的 `style`，缺省继承 CLI 全局参数。
+
+### decorations.json（用户手写）
+
+```json
+{
+  "entries": [
+    {
+      "box": "speaker_tag",
+      "start": 0.0, "end": 5.0,
+      "type": "text",
+      "content": "羽那"
+    },
+    {
+      "box": "dialogue",
+      "start": 0.0, "end": 5.0,
+      "type": "text",
+      "content": "呼啊——"
+    }
+  ]
+}
+```
+
+同一时间戳可有多条 entry 指向不同 box，同时渲染。`type` 支持 `"text"` 和 `"image"`。
+
+### 命令行参数
+
+| 参数              | 默认值                              | 说明                           |
+| ----------------- | ----------------------------------- | ------------------------------ |
+| `--input`         | 无（合成模式必需）                  | 输入视频                       |
+| `--calibrate`     | 关                                  | 进入交互式标定模式             |
+| `--image`         | 无                                  | 标定参考图（不传则从视频抽帧） |
+| `--boxes`         | `work/<项目>/decor_boxes.json`      | boxes 文件路径                 |
+| `--decorations`   | `work/<项目>/output/decorations.json` | decorations 文件路径         |
+| `--output`        | `work/<项目>/output/final_decorated.mp4` | 输出视频                 |
+
+样式参数与 `translate_workflow.py` 共用同一套：`--font-size`、`--box-color`、`--box-opacity`、`--text-color`、`--stroke-color`、`--stroke-width`、`--box-radius`、`--streaming-speed`、`--no-streaming`。
 
 ## 字体
 
