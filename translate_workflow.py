@@ -240,8 +240,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--crf",
         type=int,
-        default=23,
-        help="ffmpeg H.264 压缩质量，数值越小质量越高文件越大，默认 23",
+        default=18,
+        help="ffmpeg H.264 压缩质量，数值越小质量越高文件越大，默认 18",
     )
     parser.add_argument(
         "--preset",
@@ -273,17 +273,35 @@ def clamp_opacity(value: int) -> int:
     return value
 
 
-def build_render_style(args: argparse.Namespace) -> RenderStyle:
+def build_render_style(
+    args: argparse.Namespace,
+    overrides: Optional[Dict] = None,
+) -> RenderStyle:
+    """从 CLI 参数构建渲染样式，可选地从 boxes.json 的 style 字段覆盖。"""
+    style_data = {
+        "font_size": max(1, args.font_size),
+        "box_color": args.box_color,
+        "box_opacity": args.box_opacity,
+        "text_color": args.text_color,
+        "stroke_color": args.stroke_color,
+        "stroke_width": args.stroke_width,
+        "box_radius": args.box_radius,
+        "streaming": not args.no_streaming,
+        "chars_per_sec": float(args.streaming_speed),
+    }
+    if overrides:
+        style_data.update({k: v for k, v in overrides.items() if v is not None})
+
     return RenderStyle(
-        font_size=max(1, args.font_size),
-        box_color=parse_hex_color(args.box_color),
-        box_opacity=clamp_opacity(args.box_opacity),
-        text_color=parse_hex_color(args.text_color),
-        stroke_color=parse_hex_color(args.stroke_color),
-        stroke_width=max(0, args.stroke_width),
-        box_radius=max(0, args.box_radius),
-        streaming=not args.no_streaming,
-        chars_per_sec=float(args.streaming_speed),
+        font_size=max(1, int(style_data["font_size"])),
+        box_color=parse_hex_color(style_data["box_color"]),
+        box_opacity=clamp_opacity(int(style_data["box_opacity"])),
+        text_color=parse_hex_color(style_data["text_color"]),
+        stroke_color=parse_hex_color(style_data["stroke_color"]),
+        stroke_width=max(0, int(style_data["stroke_width"])),
+        box_radius=max(0, int(style_data["box_radius"])),
+        streaming=bool(style_data["streaming"]),
+        chars_per_sec=float(style_data["chars_per_sec"]),
     )
 
 
@@ -329,8 +347,16 @@ def analyze_video(path: str) -> Tuple[float, int, int, float]:
     return fps, width, height, duration
 
 
-def estimate_boxes(width: int, height: int) -> Dict[str, Tuple[int, int, int, int]]:
+def estimate_boxes(
+    width: int, height: int,
+) -> Tuple[Dict[str, Tuple[int, int, int, int]], Optional[Dict]]:
+    """返回 (boxes_dict, style_overrides)。
+
+    boxes_dict 包含 ocr_box / overlay_box 坐标。
+    style_overrides 从 boxes.json 的 style 字段读取，不存在或文件缺失时为 None。
+    """
     boxes_file = os.path.join(WORK_DIR, "boxes.json")
+    style_overrides: Optional[Dict] = None
     if os.path.exists(boxes_file):
         with open(boxes_file, "r", encoding="utf-8") as f:
             saved = json.load(f)
@@ -339,10 +365,12 @@ def estimate_boxes(width: int, height: int) -> Dict[str, Tuple[int, int, int, in
                 f"警告: boxes.json 标定分辨率 {saved.get('width')}x{saved.get('height')} "
                 f"与当前视频 {width}x{height} 不匹配，建议重新标定"
             )
-        return {
+        boxes = {
             "ocr_box": tuple(saved["ocr_box"]),
             "overlay_box": tuple(saved["overlay_box"]),
         }
+        style_overrides = saved.get("style")
+        return boxes, style_overrides
 
     # 回退：硬编码百分比
     ocr_box = (
@@ -357,7 +385,7 @@ def estimate_boxes(width: int, height: int) -> Dict[str, Tuple[int, int, int, in
         int(width * 0.73),
         int(height * 0.135),
     )
-    return {"ocr_box": ocr_box, "overlay_box": overlay_box}
+    return {"ocr_box": ocr_box, "overlay_box": overlay_box}, None
 
 
 def crop_region(frame: np.ndarray, box: Tuple[int, int, int, int]) -> np.ndarray:
@@ -1409,7 +1437,6 @@ def main() -> None:
     configure_environment()
     load_dotenv()
     args = parse_args()
-    style = build_render_style(args)
     input_video = os.path.abspath(args.input)
     if not os.path.exists(input_video):
         raise FileNotFoundError(f"请先将原始视频放入 {input_video}")
@@ -1434,10 +1461,13 @@ def main() -> None:
         print(f"  OCR 区域: {boxes['ocr_box']}")
         print(f"  覆盖区域: {boxes['overlay_box']}")
 
-    boxes = estimate_boxes(width, height)
+    boxes, style_overrides = estimate_boxes(width, height)
+    style = build_render_style(args, style_overrides)
     print(f"视频分析: fps={fps:.2f}, 分辨率={width}x{height}, 时长={duration:.2f}s")
     print(f"OCR 区域: {boxes['ocr_box']}")
     print(f"覆盖区域: {boxes['overlay_box']}")
+    if style_overrides:
+        print(f"从 boxes.json 加载了自定义样式: {style_overrides}")
 
     if args.load_segments:
         if not os.path.exists(SEGMENTS_JSON):
