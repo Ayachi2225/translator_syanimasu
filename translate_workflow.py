@@ -1010,9 +1010,15 @@ def assign_translations(segments: List[Segment], raw_texts: List[str], translate
 
 
 def save_segments(segments: List[Segment], path: str) -> None:
-    """保存翻译片段到 JSON，方便校对后重新渲染。"""
+    """保存翻译片段到 JSON，方便校对后重新渲染。
+    跳过无 OCR 文本的空 segment（ja 为空），保持时间轴干净。
+    """
     data = []
+    skipped = 0
     for seg in segments:
+        if not seg.ja:
+            skipped += 1
+            continue
         data.append({
             "start": seg.start,
             "end": seg.end,
@@ -1021,7 +1027,10 @@ def save_segments(segments: List[Segment], path: str) -> None:
         })
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"segments": data}, f, indent=2, ensure_ascii=False)
-    print(f"翻译片段已保存到 {path}，可编辑 zh 字段校对后使用 --load-segments 重新渲染")
+    msg = f"翻译片段已保存到 {path}，可编辑 zh 字段校对后使用 --load-segments 重新渲染"
+    if skipped:
+        msg += f"（已跳过 {skipped} 个空片段）"
+    print(msg)
 
 
 def load_segments(path: str) -> List[Segment]:
@@ -1210,28 +1219,27 @@ def render_frame(
         else:
             display_text = segment.zh
 
-    if segment:
+    if segment and display_text:
         draw.rounded_rectangle(
             [x, y, x + w, y + h],
             radius=style.box_radius,
             fill=(*style.box_color, style.box_opacity),
         )
-        if display_text:
-            lines = wrap_text(display_text, font, w - 32)
-            total_height = sum(text_size(font, line)[1] for line in lines) + 12 * (len(lines) - 1)
-            current_y = y + (h - total_height) // 3
-            for line in lines:
-                line_width, line_height = text_size(font, line)
-                line_x = x + 24
-                draw.text(
-                    (line_x, current_y),
-                    line,
-                    font=font,
-                    fill=style.text_color,
-                    stroke_width=style.stroke_width,
-                    stroke_fill=style.stroke_color,
-                )
-                current_y += line_height + 12
+        lines = wrap_text(display_text, font, w - 32)
+        total_height = sum(text_size(font, line)[1] for line in lines) + 12 * (len(lines) - 1)
+        current_y = y + (h - total_height) // 3
+        for line in lines:
+            line_width, line_height = text_size(font, line)
+            line_x = x + 24
+            draw.text(
+                (line_x, current_y),
+                line,
+                font=font,
+                fill=style.text_color,
+                stroke_width=style.stroke_width,
+                stroke_fill=style.stroke_color,
+            )
+            current_y += line_height + 12
     return pil.convert("RGB")
 
 
