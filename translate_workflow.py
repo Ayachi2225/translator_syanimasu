@@ -482,8 +482,10 @@ def group_samples_by_text(
     if current_group:
         groups.append(current_group)
 
+    # 第一步：从非空组创建 segment，记录每个 segment 来自哪个组
     segments: List[Segment] = []
-    for group in groups:
+    seg_group_idx: List[int] = []  # segments[i] 来自 groups[seg_group_idx[i]]
+    for gi, group in enumerate(groups):
         candidates = [(i, all_texts[i]) for i in group if all_texts[i] and not is_noise_text(all_texts[i])]
         if not candidates:
             continue
@@ -494,11 +496,22 @@ def group_samples_by_text(
             ja=best_text,
         )
         segments.append(seg)
+        seg_group_idx.append(gi)
 
+    # 第二步：全部串联（相邻 segment 首尾相连）
     for i in range(len(segments) - 1):
         segments[i].end = segments[i + 1].start
     if segments:
         segments[-1].end = duration
+
+    # 第三步：裁剪 — 如果两个 segment 之间跳过了空组，
+    # 把前一个 segment 的 end 裁到它自己组的最后一帧
+    for i in range(len(segments) - 1):
+        gi = seg_group_idx[i]
+        next_gi = seg_group_idx[i + 1]
+        if next_gi > gi + 1:
+            # 中间有空组 → 裁掉空白期
+            segments[i].end = samples[groups[gi][-1]]['time']
 
     return segments
 
@@ -792,8 +805,7 @@ def merge_progressive_segments(segments: List[Segment]) -> List[Segment]:
     merged: List[Segment] = []
     for segment in segments:
         if is_noise_text(segment.ja):
-            if merged:
-                merged[-1].end = segment.end
+            # 噪声文本：跳过，不延长前一段的显示时间
             continue
 
         if merged and (
