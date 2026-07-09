@@ -483,22 +483,22 @@ def group_samples_by_text(
         groups.append(current_group)
 
     segments: List[Segment] = []
-    for group in groups:
+    for group_index, group in enumerate(groups):
         candidates = [(i, all_texts[i]) for i in group if all_texts[i] and not is_noise_text(all_texts[i])]
         if not candidates:
             continue
         _, best_text = max(candidates, key=lambda x: _score_ocr_text(x[1]))
+        next_group_start = (
+            samples[groups[group_index + 1][0]]['time']
+            if group_index + 1 < len(groups)
+            else duration
+        )
         seg = Segment(
             start=samples[group[0]]['time'],
-            end=None,
+            end=next_group_start,
             ja=best_text,
         )
         segments.append(seg)
-
-    for i in range(len(segments) - 1):
-        segments[i].end = segments[i + 1].start
-    if segments:
-        segments[-1].end = duration
 
     return segments
 
@@ -792,8 +792,6 @@ def merge_progressive_segments(segments: List[Segment]) -> List[Segment]:
     merged: List[Segment] = []
     for segment in segments:
         if is_noise_text(segment.ja):
-            if merged:
-                merged[-1].end = segment.end
             continue
 
         if merged and (
@@ -939,7 +937,7 @@ def init_ocr_engine():
         try:
             # 必须先导入 torch 再导入 paddleocr，避免 Windows DLL 加载顺序问题
             try:
-                import torch  # noqa: F401
+                import torch  # type: ignore # noqa: F401
             except ImportError:
                 pass
 
@@ -1401,7 +1399,7 @@ def calibrate_boxes(video_path: str, duration: float) -> Dict[str, Any]:
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频文件: {video_path}")
 
-    target_time = duration * 0.3
+    target_time = duration * 0.4
     cap.set(cv2.CAP_PROP_POS_MSEC, target_time * 1000)
     ret, frame = cap.read()
     if not ret:
