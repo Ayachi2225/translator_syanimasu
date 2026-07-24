@@ -76,6 +76,7 @@ python translate_workflow.py --input input/p1.mp4 --load-segments
 | 参数                      | 默认值              | 说明                                           |
 | ------------------------- | ------------------- | ---------------------------------------------- |
 | `--input`                 | `input/input.mp4`   | 输入视频路径                                   |
+| `--time`                  | `35`                | 首次标定 OCR 和字幕覆盖区域时抽取参考帧的时间点（秒） |
 | `--no-translate`          | 关                  | 跳过翻译，OCR 原文作为字幕（快速预览）         |
 | `--load-segments`         | 关                  | 从 segments.json 加载校对后文本，跳过 OCR+翻译 |
 | `--model`                 | `deepseek-v4-flash` | DeepSeek 翻译模型                              |
@@ -196,7 +197,7 @@ translator_syanimasu/
         ├── decor_boxes.json       # 装饰标定坐标（多区域命名）
         └── output/
             ├── segments.json      # 翻译片段（校对编辑此文件）
-            ├── decorations.json   # 装饰数据（用户手写）
+            ├── decorations.json   # 装饰数据（标定自动生成模板，用户编辑）
             ├── subtitles.ass      # 中文字幕
             ├── subtitles_ja.ass   # 日语字幕
             ├── final_cn.mp4       # 翻译成品视频
@@ -238,13 +239,17 @@ python translate_workflow.py --input input/p1.mp4 --sample-frame-interval 5
 ### 两步法
 
 ```
-标定                              合成
-───────────                    ─────────────────────
-参考图 → 框选区域并命名           视频 + decor_boxes.json
-  │                                + decorations.json
-  ▼                                  │
-decor_boxes.json ──────────▶  final_decorated.mp4
+标定                                    合成
+───────────                          ─────────────────────
+参考图 → 框选区域并命名                 视频 + decor_boxes.json
+  │                                      + decorations.json
+  ├──▶ decor_boxes.json                  │
+  │                                      ▼
+  └──▶ decorations.json (自动生成) ──▶ final_decorated.mp4
 ```
+
+标定结束后会自动生成 `decor_boxes.json` 和 `decorations.json` 模板，
+编辑 `decorations.json` 填入实际内容和时间范围即可合成。
 
 ### 快速开始
 
@@ -252,31 +257,33 @@ decor_boxes.json ──────────▶  final_decorated.mp4
 # 第一步：标定（从视频抽参考帧）
 python decorate_workflow.py --calibrate --input input/p1.mp4
 
-# 或指定参考图片
+# 或指定参考图片 + 抽帧时间（start/end 默认使用该时间值）
 python decorate_workflow.py --calibrate --input input/p1.mp4 --time 1:30
 
-# 第二步：手写 work/<项目>/output/decorations.json
+# 第二步：编辑自动生成的 work/<项目>/output/decorations.json，填入内容和时间
 
 # 第三步：合成
 python decorate_workflow.py --input input/p1.mp4
 ```
 
-### decor_boxes.json（标定生成）
+### decor_boxes.json（标定自动生成）
+
+标定时框选区域后输入名称，**留空则自动按 1, 2, 3 ... 顺序命名**。
 
 ```json
 {
   "width": 1920,
   "height": 1080,
   "boxes": {
-    "speaker_tag": {
+    "1": {
       "type": "text",
       "box": [80, 40, 320, 64],
       "style": {}
     },
-    "dialogue": {
+    "2": {
       "type": "text",
       "box": [120, 820, 1680, 180],
-      "style": {"font_size": 46}
+      "style": { "font_size": 46 }
     }
   }
 }
@@ -284,20 +291,25 @@ python decorate_workflow.py --input input/p1.mp4
 
 每个 box 可指定独立的 `style`，缺省继承 CLI 全局参数。
 
-### decorations.json（用户手写）
+### decorations.json（标定自动生成模板，用户编辑）
+
+标定结束后自动生成模板，`start` / `end` 默认使用 `--time` 参数值（未指定则为 `0.0`）。
+编辑 `content` 和时间范围后即可合成。
 
 ```json
 {
   "entries": [
     {
       "box": "speaker_tag",
-      "start": 0.0, "end": 5.0,
+      "start": 0.0,
+      "end": 5.0,
       "type": "text",
       "content": "羽那"
     },
     {
       "box": "dialogue",
-      "start": 0.0, "end": 5.0,
+      "start": 0.0,
+      "end": 5.0,
       "type": "text",
       "content": "呼啊——"
     }
@@ -309,15 +321,15 @@ python decorate_workflow.py --input input/p1.mp4
 
 ### 命令行参数
 
-| 参数              | 默认值                              | 说明                           |
-| ----------------- | ----------------------------------- | ------------------------------ |
-| `--input`         | 无（合成模式必需）                  | 输入视频                       |
-| `--calibrate`     | 关                                  | 进入交互式标定模式             |
-| `--image`         | 无                                  | 标定参考图（也可用 --time 从视频抽帧） |
-| `--time`          | 30% 位置                            | 从视频指定时间点抽帧（`1:30` 或 `90.5`） |
-| `--boxes`         | `work/<项目>/decor_boxes.json`      | boxes 文件路径                 |
-| `--decorations`   | `work/<项目>/output/decorations.json` | decorations 文件路径         |
-| `--output`        | `work/<项目>/output/final_decorated.mp4` | 输出视频                 |
+| 参数            | 默认值                                   | 说明                                     |
+| --------------- | ---------------------------------------- | ---------------------------------------- |
+| `--input`       | 无（合成模式必需）                       | 输入视频                                 |
+| `--calibrate`   | 关                                       | 进入交互式标定模式                       |
+| `--image`       | 无                                       | 标定参考图（也可用 --time 从视频抽帧）   |
+| `--time`        | 30% 位置                                 | 从视频指定时间点抽帧（`1:30` 或 `90.5`），同时作为 decorations.json 默认 start/end |
+| `--boxes`       | `work/<项目>/decor_boxes.json`           | boxes 文件路径                           |
+| `--decorations` | `work/<项目>/output/decorations.json`    | decorations 文件路径                     |
+| `--output`      | `work/<项目>/output/final_decorated.mp4` | 输出视频                                 |
 
 样式参数与 `translate_workflow.py` 共用同一套：`--font-size`、`--box-color`、`--box-opacity`、`--text-color`、`--stroke-color`、`--stroke-width`、`--box-radius`、`--streaming-speed`、`--no-streaming`。
 

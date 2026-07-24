@@ -127,6 +127,12 @@ def parse_args() -> argparse.Namespace:
         help="输入视频文件，默认 input/input.mp4",
     )
     parser.add_argument(
+        "--time",
+        type=float,
+        default=35.0,
+        help="首次标定 OCR 和字幕覆盖区域时抽取参考帧的时间点（秒），默认 35",
+    )
+    parser.add_argument(
         "--no-translate",
         action="store_true",
         help="跳过 DeepSeek 翻译，用 OCR 原文生成字幕和预览视频",
@@ -441,14 +447,18 @@ def group_samples_by_text(
     duration: float,
     overlap_threshold: float = DEFAULT_GROUP_OVERLAP,
     length_ratio_threshold: float = DEFAULT_LENGTH_RATIO,
-) -> List[Segment]:
+) -> Tuple[List[Segment], List[List[int]]]:
     """基于 OCR 文本相似度进行对话分组。
 
     遍历所有采样帧，将连续、文本相似的帧归为同一 segment。
     每组取最高分 OCR 结果作为代表文本。
+
+    Returns:
+        (segments, groups): segments 为对话片段列表，
+        groups 为原始分组索引（供边界精炼使用）。
     """
     if not samples:
-        return []
+        return [], []
 
     groups: List[List[int]] = []
     current_group = [0]
@@ -482,6 +492,7 @@ def group_samples_by_text(
     if current_group:
         groups.append(current_group)
 
+    segments: List[Segment] = []
     for group_index, group in enumerate(groups):
         candidates = [(i, all_texts[i]) for i in group if all_texts[i] and not is_noise_text(all_texts[i])]
         if not candidates:
@@ -499,7 +510,147 @@ def group_samples_by_text(
         )
         segments.append(seg)
 
-    return segments
+    return segments, groups
+
+
+# ---------------------------------------------------------------------------
+# 边界精炼：二分搜索精确过渡帧
+# ---------------------------------------------------------------------------
+
+def _find_transition_by_frame_mad(
+    cap: cv2.VideoCapture,
+    frame_lo: int,
+    frame_hi: int,
+    ref_lo: np.ndarray,
+    ref_hi: np.ndarray,
+    ocr_box: Tuple[int, int, int, int],
+    fps: float,
+    direction: str,
+) -> float:
+    """在两个采样帧之间按相邻帧 MAD 峰值定位文字切换帧。
+
+    Parameters
+    ----------
+    direction:
+        仅用于说明边界方向；消失和出现都以相邻文字蒙版的最大 MAD 为准。
+    """
+    if frame_hi <= frame_lo:
+        return frame_hi / fps
+
+    def _read_and_preprocess(frame_idx: int) -> Optional[np.ndarray]:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        ret, frame = cap.read()
+        if not ret:
+            return None
+        return prepare_text_mask_for_diff(crop_region(frame, ocr_box))
+
+    previous = _read_and_preprocess(frame_lo)
+    if previous is None:
+        return frame_hi / fps
+
+    peak_diff = -1.0
+    transition_frame = frame_hi
+    for frame_idx in range(frame_lo + 1, frame_hi + 1):
+        current = _read_and_preprocess(frame_idx)
+        if current is None:
+            break
+        frame_diff = mean_abs_diff(previous, current)
+        if frame_diff > peak_diff:
+            peak_diff = frame_diff
+            transition_frame = frame_idx
+        previous = current
+
+    return transition_frame / fps
+
+
+def refine_segment_boundaries(
+    segments: List[Segment],
+    groups: List[List[int]],
+    samples: List[Dict],
+    all_texts: List[str],
+    video_path: str,
+    ocr_box: Tuple[int, int, int, int],
+    fps: float,
+) -> List[Segment]:
+    """精炼 segment 边界 —— 搜索相邻帧 MAD 峰值，误差缩小到 1 帧以内。
+
+    对每对相邻 group（文本↔空白）的边界做 MAD 像素差异二分搜索：
+    - 文本→空白（消失）：取文字蒙版相邻帧 MAD 的最大突变点
+    - 空白→文本（出现）：同样取最大突变点，让空白段夹在两个边界之间
+    """
+    if len(groups) < 2:
+        return segments
+
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print("  警告: 无法打开视频进行边界精炼，使用粗边界")
+        return segments
+
+    # 边界精炼只比较亮色文字蒙版。直接比较整块灰度图时，动态背景会
+    # 让较晚采到的空白参考帧与真实消失帧差异很大，从而把 end 拖后。
+    ref_first = [prepare_text_mask_for_diff(samples[g[0]]['crop']) for g in groups]
+    ref_last = [prepare_text_mask_for_diff(samples[g[-1]]['crop']) for g in groups]
+
+    # 判断每个 group 是否为空白组
+    is_blank_group: List[bool] = []
+    for group in groups:
+        blank = True
+        for i in group:
+            if all_texts[i] and not is_noise_text(all_texts[i]):
+                blank = False
+                break
+        is_blank_group.append(blank)
+
+    refined: List[Segment] = []
+    seg_idx = 0
+    refined_count = 0
+
+    for gi, group in enumerate(groups):
+        if is_blank_group[gi]:
+            continue  # 空白组不产生 segment
+
+        if seg_idx >= len(segments):
+            break
+
+        seg = segments[seg_idx]
+        seg_idx += 1
+
+        # ── 精炼 start：空白→文本过渡 ──
+        if gi > 0 and is_blank_group[gi - 1]:
+            prev_group = groups[gi - 1]
+            frame_lo = samples[prev_group[-1]]['frame_index']
+            frame_hi = samples[group[0]]['frame_index']
+            if frame_hi - frame_lo > 1:
+                ref_lo = ref_last[gi - 1]    # 空白组末帧
+                ref_hi = ref_first[gi]        # 文本组首帧
+                seg.start = _find_transition_by_frame_mad(
+                    cap, frame_lo, frame_hi, ref_lo, ref_hi,
+                    ocr_box, fps, direction='to_text',
+                )
+                refined_count += 1
+
+        # ── 精炼 end：文本→空白过渡 ──
+        if gi + 1 < len(groups) and is_blank_group[gi + 1]:
+            next_group = groups[gi + 1]
+            frame_lo = samples[group[-1]]['frame_index']
+            frame_hi = samples[next_group[0]]['frame_index']
+            if frame_hi - frame_lo > 1:
+                ref_lo = ref_last[gi]         # 文本组末帧
+                ref_hi = ref_first[gi + 1]    # 空白组首帧
+                seg.end = _find_transition_by_frame_mad(
+                    cap, frame_lo, frame_hi, ref_lo, ref_hi,
+                    ocr_box, fps, direction='to_blank',
+                )
+                refined_count += 1
+
+        refined.append(seg)
+
+    cap.release()
+
+    if refined_count:
+        print(f"  边界精炼: {refined_count} 个边界已精确到帧级 (< 0.1s)")
+
+    return refined
 
 
 def extract_ocr_text(ocr_result) -> str:
@@ -1217,11 +1368,14 @@ def render_frame(
             display_text = segment.zh
 
     if segment and display_text:
-        draw.rounded_rectangle(
-            [x, y, x + w, y + h],
-            radius=style.box_radius,
-            fill=(*style.box_color, style.box_opacity),
-        )
+        # opacity=0 时完全跳过背景绘制，避免图像库的透明混合或
+        # RGB 转换产生残留；只保留字幕文字。
+        if style.box_opacity > 0:
+            draw.rounded_rectangle(
+                [x, y, x + w, y + h],
+                radius=style.box_radius,
+                fill=(*style.box_color, style.box_opacity),
+            )
         lines = wrap_text(display_text, font, w - 32)
         total_height = sum(text_size(font, line)[1] for line in lines) + 12 * (len(lines) - 1)
         current_y = y + (h - total_height) // 3
@@ -1329,6 +1483,16 @@ def prepare_crop_for_diff(crop: np.ndarray, target_size: Tuple[int, int] = MAD_S
     return gray
 
 
+def prepare_text_mask_for_diff(
+    crop: np.ndarray,
+    target_size: Tuple[int, int] = MAD_SAMPLE_SIZE,
+) -> np.ndarray:
+    """提取边界检测所需的亮色文字，排除 OCR 区域中的动态背景。"""
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+    _, mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+    return cv2.resize(mask, target_size, interpolation=cv2.INTER_NEAREST)
+
+
 def mean_abs_diff(img1: np.ndarray, img2: np.ndarray) -> float:
     """计算两幅图像的 Mean Absolute Difference。"""
     diff = cv2.absdiff(img1.astype(np.float32), img2.astype(np.float32))
@@ -1392,13 +1556,23 @@ def detect_dialogue_segments_mad(
     return segments, boundaries
 
 
-def calibrate_boxes(video_path: str, duration: float) -> Dict[str, Any]:
+def calibrate_boxes(
+    video_path: str,
+    duration: float,
+    reference_time: float = 35.0,
+) -> Dict[str, Any]:
     """抽取视频参考帧，让用户用鼠标框选 OCR 区域和字幕覆盖区域。"""
+    if reference_time < 0:
+        raise ValueError("--time 必须大于或等于 0")
+
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频文件: {video_path}")
 
-    target_time = duration * 0.4
+    # OpenCV 在精确定位到视频末尾时通常无法读取帧，短视频取末尾前一帧。
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frame_margin = 1.0 / fps if fps > 0 else 0.1
+    target_time = min(reference_time, max(0.0, duration - frame_margin))
     cap.set(cv2.CAP_PROP_POS_MSEC, target_time * 1000)
     ret, frame = cap.read()
     if not ret:
@@ -1459,7 +1633,7 @@ def main() -> None:
     boxes_path = os.path.join(WORK_DIR, "boxes.json")
     if not os.path.exists(boxes_path):
         print("未找到标定文件，进入交互式标定...")
-        boxes = calibrate_boxes(input_video, duration)
+        boxes = calibrate_boxes(input_video, duration, args.time)
         with open(boxes_path, "w", encoding="utf-8") as f:
             json.dump(boxes, f, indent=2, ensure_ascii=False)
         print(f"标定完成，坐标已保存到 {boxes_path}")
@@ -1531,6 +1705,23 @@ def main() -> None:
                     best_text, _ = max(valid, key=lambda x: _score_ocr_text(x[0]))
                     seg.ja = best_text
             print("多帧 OCR 择优完成")
+
+            # === 边界精炼（MAD 管线）===
+            # 从 boundary_indices 构建 groups + all_texts 供精炼使用
+            _groups_mad: List[List[int]] = []
+            for _j in range(len(boundary_indices)):
+                _start = boundary_indices[_j]
+                _end = boundary_indices[_j + 1] if _j + 1 < len(boundary_indices) else len(samples)
+                _groups_mad.append(list(range(_start, _end)))
+            _all_texts_mad = [""] * len(samples)
+            for _j, _seg in enumerate(segments):
+                if _j < len(_groups_mad):
+                    for _idx in _groups_mad[_j]:
+                        _all_texts_mad[_idx] = _seg.ja
+            segments = refine_segment_boundaries(
+                segments, _groups_mad, samples, _all_texts_mad,
+                input_video, boxes['ocr_box'], fps,
+            )
 
             # === Step 7: 长 segment 拆分（> 5s 的 segment 检查 1/3 与 2/3 处是否不同）===
             new_segments: List[Segment] = []
@@ -1604,12 +1795,18 @@ def main() -> None:
             all_texts = ocr_dialogue(all_crops, ocr_engine)
             print(f"OCR 完成: {len(all_texts)} 帧")
 
-            segments = group_samples_by_text(
+            segments, groups = group_samples_by_text(
                 samples, all_texts, duration,
                 overlap_threshold=args.group_overlap,
                 length_ratio_threshold=args.length_ratio,
             )
             print(f"文本分组后 {len(segments)} 个对话片段")
+
+            # === 边界精炼 ===
+            segments = refine_segment_boundaries(
+                segments, groups, samples, all_texts,
+                input_video, boxes['ocr_box'], fps,
+            )
 
             # === 曲线分析拆分（可选）===
             if args.curve_split:

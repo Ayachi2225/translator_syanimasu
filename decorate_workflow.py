@@ -15,8 +15,12 @@ decorate_workflow.py —— 多区域装饰叠加脚本
   # 标定（从视频抽帧）
   python decorate_workflow.py --calibrate --input input/p1.mp4
 
-  # 合成
+  # 合成（自动查找 work/*/output/final_cn.mp4）
+  python decorate_workflow.py
+
+  # 合成（指定输入）
   python decorate_workflow.py --input input/p1.mp4
+  python decorate_workflow.py --input work/p8/output/final_cn.mp4
 """
 
 import argparse
@@ -86,12 +90,58 @@ def configure_work_paths(video_path: str) -> None:
     global WORK_DIR, OUTPUT_DIR, DECOR_BOXES_JSON, DECORATIONS_JSON
     global OUTPUT_VIDEO, TEMP_VIDEO
 
-    WORK_DIR = os.path.join(WORK_ROOT, safe_project_name(video_path))
+    WORK_DIR = os.path.join(WORK_ROOT, derive_project_name(video_path))
     OUTPUT_DIR = os.path.join(WORK_DIR, "output")
     DECOR_BOXES_JSON = os.path.join(WORK_DIR, "decor_boxes.json")
     DECORATIONS_JSON = os.path.join(OUTPUT_DIR, "decorations.json")
     OUTPUT_VIDEO = os.path.join(OUTPUT_DIR, "final_decorated.mp4")
     TEMP_VIDEO = os.path.join(OUTPUT_DIR, "rendered_temp.mp4")
+
+
+def derive_project_name(video_path: str) -> str:
+    """从视频路径推断项目名称。
+
+    如果视频位于 work/<project>/... 下，直接提取 <project>；
+    否则使用 safe_project_name() 从文件名推断。
+    """
+    abs_path = os.path.abspath(video_path)
+    abs_work_root = os.path.abspath(WORK_ROOT)
+    try:
+        rel = os.path.relpath(abs_path, abs_work_root)
+    except ValueError:
+        return safe_project_name(video_path)
+
+    if rel.startswith("..") or os.path.isabs(rel):
+        return safe_project_name(video_path)
+
+    parts = rel.replace("\\", "/").split("/")
+    return parts[0] if parts[0] else safe_project_name(video_path)
+
+
+def auto_detect_input_video() -> Optional[str]:
+    """自动在 work/*/output/ 中查找 final_cn.mp4。
+
+    找到一个就直接返回，多个则列出候选并返回 None。
+    """
+    candidates: List[str] = []
+    if not os.path.isdir(WORK_ROOT):
+        return None
+
+    for proj in sorted(os.listdir(WORK_ROOT)):
+        video = os.path.join(WORK_ROOT, proj, "output", "final_cn.mp4")
+        if os.path.isfile(video):
+            candidates.append(os.path.abspath(video))
+
+    if not candidates:
+        return None
+    if len(candidates) == 1:
+        print(f"自动选择视频: {candidates[0]}")
+        return candidates[0]
+
+    print("找到多个 final_cn.mp4，请用 --input 明确指定:")
+    for c in candidates:
+        print(f"  {c}")
+    return None
 
 
 def ensure_dirs() -> None:
@@ -108,7 +158,10 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="多区域装饰叠加 —— 标定命名区域或合成视频"
     )
-    parser.add_argument("--input", default=None, help="输入视频路径")
+    parser.add_argument(
+        "--input", default=None,
+        help="输入视频路径（默认自动查找 work/*/output/final_cn.mp4）",
+    )
     parser.add_argument(
         "--calibrate", action="store_true",
         help="进入交互式标定模式",
@@ -304,6 +357,7 @@ def calibrate_interactive(image: np.ndarray) -> Dict[str, Any]:
     print("    1. 用鼠标框选一个矩形区域")
     print("    2. 按 ENTER 确认选区")
     print("    3. 在终端输入该区域的名称（如 'dialogue', 'speaker_tag'）")
+    print("       留空则自动按 1, 2, 3 ... 顺序命名")
     print("    4. 重复以上步骤添加更多区域")
     print("    5. 按 ESC 或在名称提示中输入 'done' 结束标定")
     print()
@@ -332,12 +386,12 @@ def calibrate_interactive(image: np.ndarray) -> Dict[str, Any]:
         # 终端输入名称
         name = input(
             f"  为此区域命名 (Box #{box_count + 1})，"
-            f"回车跳过 / 输入 'done' 结束: "
+            f"留空自动编号 / 输入 'done' 结束: "
         ).strip()
 
         if not name:
-            print("  跳过该区域（未命名）。")
-            continue
+            name = str(box_count + 1)
+            print(f"  自动命名: '{name}'")
         if name.lower() in ("done", "quit", "exit"):
             print("标定完成。")
             break
@@ -406,6 +460,50 @@ def run_calibrate(args: argparse.Namespace) -> None:
     print(f"  Box 总数: {len(result['boxes'])}")
     for name, bdef in result["boxes"].items():
         print(f"    {name}: type={bdef['type']}, box={bdef['box']}")
+
+    # 自动生成 decorations.json 模板
+    _generate_decorations_template(args, result, boxes_path)
+
+
+def _generate_decorations_template(
+    args: argparse.Namespace,
+    result: Dict[str, Any],
+    boxes_path: str,
+) -> None:
+    """根据标定结果自动生成 decorations.json 模板。
+
+    start / end 默认使用 --time 参数值，未指定则默认为 0.0。
+    """
+    # 解析默认时间
+    if args.time:
+        deco_time = parse_time_arg(args.time)
+    else:
+        deco_time = 0.0
+
+    # 确定保存路径
+    if args.input:
+        decorations_path = args.decorations or DECORATIONS_JSON
+    else:
+        decorations_path = args.decorations or os.path.join(
+            os.path.dirname(boxes_path), "decorations.json"
+        )
+
+    entries = []
+    for name, bdef in result["boxes"].items():
+        entries.append({
+            "box": name,
+            "start": deco_time,
+            "end": deco_time,
+            "type": bdef.get("type", "text"),
+            "content": "",
+        })
+
+    decorations_data = {"entries": entries}
+    os.makedirs(os.path.dirname(decorations_path), exist_ok=True)
+    with open(decorations_path, "w", encoding="utf-8") as f:
+        json.dump(decorations_data, f, indent=2, ensure_ascii=False)
+    print(f"装饰模板已保存到 {decorations_path}")
+    print(f"  默认 start/end = {deco_time:.1f}s（可通过 --time 参数指定）")
 
 
 # ---------------------------------------------------------------------------
@@ -521,6 +619,15 @@ def render_frame_multi(
     return pil.convert("RGB")
 
 
+def get_decoration_time_range(entries: List[Dict]) -> Tuple[float, float]:
+    """返回装饰条目的整体时间范围 (min_start, max_end)。"""
+    starts = [e.get("start", 0.0) for e in entries]
+    ends = [e.get("end", float("inf")) for e in entries]
+    min_start = min(starts) if starts else 0.0
+    max_end = max(e for e in ends if e != float("inf")) if ends else 0.0
+    return min_start, max_end
+
+
 def render_video_with_opencv_multi(
     video_path: str,
     output_path: str,
@@ -528,8 +635,12 @@ def render_video_with_opencv_multi(
     boxes_def: Dict[str, Dict],
     fps: float,
     global_style: Dict,
+    total_frames: int = 0,
 ) -> None:
-    """逐帧渲染，将装饰叠加到视频上。"""
+    """逐帧渲染，将装饰叠加到视频上。
+
+    只有存在活跃装饰的帧才走 PIL 合成路径，其余帧直接复制原帧。
+    """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"无法打开视频: {video_path}")
@@ -548,6 +659,14 @@ def render_video_with_opencv_multi(
             "OpenCV 无法创建输出 mp4，请安装 ffmpeg: brew install ffmpeg"
         )
 
+    deco_start, deco_end = get_decoration_time_range(entries)
+    deco_start_frame = int(deco_start * fps)
+    deco_end_frame = int(deco_end * fps) + 1
+    print(
+        f"  装饰时间范围: {deco_start:.1f}s – {deco_end:.1f}s "
+        f"(帧 {deco_start_frame} – {deco_end_frame})"
+    )
+
     fonts: Dict[int, ImageFont.FreeTypeFont] = {}
     idx = 0
     while True:
@@ -555,9 +674,20 @@ def render_video_with_opencv_multi(
         if not ret:
             break
         timestamp = idx / fps
+
+        # 快速路径：帧不在装饰区间内，直接写原帧
+        if idx < deco_start_frame or idx > deco_end_frame:
+            writer.write(frame)
+            idx += 1
+            continue
+
         active = find_active_entries(entries, timestamp)
-        rendered = render_frame_multi(frame, active, boxes_def, fonts, global_style)
-        writer.write(cv2.cvtColor(np.array(rendered), cv2.COLOR_RGB2BGR))
+        # 即使在装饰区间内，也可能没有活跃条目（片段间隙）
+        if not active:
+            writer.write(frame)
+        else:
+            rendered = render_frame_multi(frame, active, boxes_def, fonts, global_style)
+            writer.write(cv2.cvtColor(np.array(rendered), cv2.COLOR_RGB2BGR))
         idx += 1
 
         if idx % 300 == 0:
@@ -608,8 +738,9 @@ def run_compose(args: argparse.Namespace) -> None:
     temp_path = TEMP_VIDEO if has_ffmpeg else output_path
 
     print("开始渲染...")
+    total_frames = int(duration * fps)
     render_video_with_opencv_multi(
-        args.input, temp_path, entries, boxes_def, fps, global_style,
+        args.input, temp_path, entries, boxes_def, fps, global_style, total_frames,
     )
 
     if has_ffmpeg:
@@ -640,9 +771,14 @@ def main() -> None:
 
     # 合成模式需要 input
     if not args.input:
-        print("错误: 合成模式需要 --input <视频>")
-        print("或使用 --calibrate 进入标定模式")
-        sys.exit(1)
+        args.input = auto_detect_input_video()
+        if not args.input:
+            print(
+                "错误: 合成模式需要 --input <视频>，"
+                "或确保 work/*/output/ 下有 final_cn.mp4"
+            )
+            print("或使用 --calibrate 进入标定模式")
+            sys.exit(1)
 
     if not os.path.exists(args.input):
         raise FileNotFoundError(f"视频不存在: {args.input}")
