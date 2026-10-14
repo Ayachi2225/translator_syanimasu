@@ -4,3 +4,5 @@ work/*
 input/*
 .env
 .DS_Store
+**/*.bat
+test/*

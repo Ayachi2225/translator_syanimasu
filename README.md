@@ -73,14 +73,16 @@ python translate_workflow.py --input input/p1.mp4 --load-segments
 
 ### 核心流程
 
-| 参数                      | 默认值              | 说明                                           |
-| ------------------------- | ------------------- | ---------------------------------------------- |
-| `--input`                 | `input/input.mp4`   | 输入视频路径                                   |
-| `--time`                  | `35`                | 首次标定 OCR 和字幕覆盖区域时抽取参考帧的时间点（秒） |
-| `--no-translate`          | 关                  | 跳过翻译，OCR 原文作为字幕（快速预览）         |
-| `--load-segments`         | 关                  | 从 segments.json 加载校对后文本，跳过 OCR+翻译 |
-| `--model`                 | `deepseek-v4-flash` | DeepSeek 翻译模型                              |
-| `--sample-frame-interval` | `15`                | 每隔多少帧采样一次                             |
+| 参数                       | 默认值              | 说明                                                  |
+| -------------------------- | ------------------- | ----------------------------------------------------- |
+| `--input`                  | `input/input.mp4`   | 输入视频路径                                          |
+| `--time`                   | `35`                | 首次标定 OCR 和字幕覆盖区域时抽取参考帧的时间点（秒） |
+| `--no-translate`           | 关                  | 跳过翻译，OCR 原文作为字幕（快速预览）                |
+| `--load-segments`          | 关                  | 从 segments.json 加载校对后文本，跳过 OCR+翻译        |
+| `--model`                  | `deepseek-v4-flash` | DeepSeek 翻译模型                                     |
+| `--translation-method`     | `json`              | `json` 完整上下文翻译；`sentence` 原来的逐句翻译      |
+| `--translation-max-tokens` | `16384`             | 完整 JSON 翻译的最大输出 token 数                     |
+| `--sample-frame-interval`  | `15`                | 每隔多少帧采样一次                                    |
 
 ### 对话检测
 
@@ -91,17 +93,24 @@ python translate_workflow.py --input input/p1.mp4 --load-segments
 
 ### 渲染样式
 
-| 参数                | 默认值    | 说明                                  |
-| ------------------- | --------- | ------------------------------------- |
-| `--box-color`       | `#808080` | 对话框背景色 (#RRGGBB)                |
-| `--box-opacity`     | `230`     | 对话框透明度 (0–255)                  |
-| `--text-color`      | `#87CEEB` | 文字颜色 (#RRGGBB)                    |
-| `--stroke-color`    | `#FFFFFF` | 文字描边色 (#RRGGBB)                  |
-| `--stroke-width`    | `1`       | 描边宽度                              |
-| `--font-size`       | `42`      | 渲染字号                              |
-| `--box-radius`      | `2`       | 对话框圆角半径                        |
-| `--no-streaming`    | 关        | 禁用逐字流式显示（打字机效果）        |
-| `--streaming-speed` | `15`      | 流式速度（字/秒），时长 = 字数 ÷ 速度 |
+| 参数                | 默认值    | 说明                                     |
+| ------------------- | --------- | ---------------------------------------- |
+| `--box-color`       | `#808080` | 对话框背景色 (#RRGGBB)                   |
+| `--box-opacity`     | `230`     | 对话框透明度 (0–255)                     |
+| `--text-color`      | `#87CEEB` | 文字颜色 (#RRGGBB)                       |
+| `--stroke-color`    | `#FFFFFF` | 文字描边色 (#RRGGBB)                     |
+| `--stroke-width`    | `1`       | 描边宽度                                 |
+| `--font-size`       | `42`      | 渲染字号                                 |
+| `--box-radius`      | `2`       | 对话框圆角半径                           |
+| `--no-streaming`    | 关        | 禁用逐字流式显示（打字机效果）           |
+| `--streaming-speed` | `15`      | 流式速度（字/秒），时长 = 字数 ÷ 速度    |
+| `--subtitle-fade`   | `0.3`     | 字幕淡入、淡出各自的时长（秒）；`0` 关闭 |
+
+字幕文字及描边默认各用 0.3 秒淡入、淡出，视频中的遮挡背景保持稳定；短于 0.6 秒的片段自动缩短渐变时间。中日文 ASS 文件也会写入相同的淡入淡出效果。可直接使用现有翻译结果测试，无需重新 OCR 或调用 API：
+
+```bash
+python translate_workflow.py --input input/p23.mp4 --load-segments --subtitle-fade 0.3
+```
 
 ### 视频输出
 
@@ -136,7 +145,19 @@ python translate_workflow.py --input input/p1.mp4 --load-segments
 - 优点：OCR 调用少，适合长视频
 - 缺点：阈值需调校，依赖背景稳定
 
-两条管线共享相同的后处理：**递进文本合并 → DeepSeek 翻译(空返回重试 3 次) → 渲染**。
+两条管线共享相同的后处理：**递进文本合并 → DeepSeek 翻译 → 渲染**。
+
+默认使用 `json` 翻译方法：将所有合并后的片段以完整 `{"segments": [...]}` JSON 一次发送给模型，让模型结合全篇上下文填写 `zh` 并返回处理后的 JSON。提示词说明文本来自《偶像大师 闪耀色彩》游戏录屏 OCR，可能含乱码、错字和漏字，要求根据上下文理解原意、统一称呼和术语，并保留 `ja` 原文、时间轴和片段顺序。
+
+返回结果会校验片段数量、顺序、原文、时间轴及非空译文，格式错误最多尝试 3 次；只有全部通过校验才写入译文。翻译前先保存 OCR JSON，API 失败时原文仍保留在 `segments.json`。完整输入需要符合所选模型的上下文限制；输出被截断时脚本会报错，可在模型允许范围内调大 `--translation-max-tokens`。`--load-segments` 仍然只加载并渲染，不重新翻译。
+
+```bash
+# 默认完整 JSON 翻译，直接运行即可测试
+python translate_workflow.py --input input/p1.mp4
+
+# 切换回原来的逐句翻译，方便对比
+python translate_workflow.py --input input/p1.mp4 --translation-method sentence
+```
 
 ## 配置
 
@@ -321,15 +342,15 @@ python decorate_workflow.py --input input/p1.mp4
 
 ### 命令行参数
 
-| 参数            | 默认值                                   | 说明                                     |
-| --------------- | ---------------------------------------- | ---------------------------------------- |
-| `--input`       | 无（合成模式必需）                       | 输入视频                                 |
-| `--calibrate`   | 关                                       | 进入交互式标定模式                       |
-| `--image`       | 无                                       | 标定参考图（也可用 --time 从视频抽帧）   |
+| 参数            | 默认值                                   | 说明                                                                               |
+| --------------- | ---------------------------------------- | ---------------------------------------------------------------------------------- |
+| `--input`       | 无（合成模式必需）                       | 输入视频                                                                           |
+| `--calibrate`   | 关                                       | 进入交互式标定模式                                                                 |
+| `--image`       | 无                                       | 标定参考图（也可用 --time 从视频抽帧）                                             |
 | `--time`        | 30% 位置                                 | 从视频指定时间点抽帧（`1:30` 或 `90.5`），同时作为 decorations.json 默认 start/end |
-| `--boxes`       | `work/<项目>/decor_boxes.json`           | boxes 文件路径                           |
-| `--decorations` | `work/<项目>/output/decorations.json`    | decorations 文件路径                     |
-| `--output`      | `work/<项目>/output/final_decorated.mp4` | 输出视频                                 |
+| `--boxes`       | `work/<项目>/decor_boxes.json`           | boxes 文件路径                                                                     |
+| `--decorations` | `work/<项目>/output/decorations.json`    | decorations 文件路径                                                               |
+| `--output`      | `work/<项目>/output/final_decorated.mp4` | 输出视频                                                                           |
 
 样式参数与 `translate_workflow.py` 共用同一套：`--font-size`、`--box-color`、`--box-opacity`、`--text-color`、`--stroke-color`、`--stroke-width`、`--box-radius`、`--streaming-speed`、`--no-streaming`。
 
